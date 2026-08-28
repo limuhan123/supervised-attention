@@ -1,0 +1,11 @@
+# Python 缓存
+__pycache__/
+
+# 数据集
+data_all/
+
+# 模型权重
+weights/
+
+# IDE 配置
+.vscode/
