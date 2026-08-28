@@ -9,3 +9,4 @@ weights/
 
 # IDE 配置
 .vscode/
+.ssh/
