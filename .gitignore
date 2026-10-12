@@ -1,0 +1,23 @@
+# Python 缓存
+__pycache__/
+
+# 数据集
+data_all/
+
+# 模型权重
+weights/
+
+# IDE 配置
+.vscode/
+.ssh/
+
+# 临时文件和生成产物
+tmp/
+output/
+
+# 本地环境和凭据
+.env
+.env.*
+!.env.example
+.venv/
+venv/
