@@ -57,6 +57,44 @@ class AttentionTargetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 select(labels([], [], []), classes)
 
+    def test_strict_supervises_the_original_boundary_band(self):
+        targets = labels([[.5, .5, .4, .4]], [0], [4])
+        relaxed_logits = torch.zeros(1, 1, 40, 40, requires_grad=True)
+        strict_logits = relaxed_logits.detach().clone().requires_grad_()
+        # 关闭比例项，隔离原本被忽略的边界像素。
+        Loss.attention_loss(relaxed_logits, targets, lambda_ratio=0).backward()
+        Loss.attention_loss_strict(strict_logits, targets, lambda_ratio=0).backward()
+        self.assertEqual(relaxed_logits.grad[0, 0, 20, 12].item(), 0)
+        self.assertLess(strict_logits.grad[0, 0, 20, 12].item(), 0)
+
+    def test_strict_matches_full_box_loss_and_handles_empty_background(self):
+        generator = torch.Generator().manual_seed(42)
+        targets = labels([[.5, .5, .4, .4], [.1, .1, .4, .4], [.5, .5, 1, 1]],
+                         [0, 0, 2], [4, 4, 4])
+        a = torch.randn(3, 1, 40, 40, generator=generator, requires_grad=True)
+        b = a.detach().clone().requires_grad_()
+        strict = Loss.attention_loss_strict(a, targets)
+        reference = Loss.attention_loss(b, targets, shrink_ratio=1, expand_ratio=1)
+        torch.testing.assert_close(strict, reference, rtol=1e-6, atol=1e-7)
+        strict.backward()
+        reference.backward()
+        torch.testing.assert_close(a.grad, b.grad, rtol=1e-5, atol=1e-7)
+        self.assertTrue(torch.isfinite(a.grad).all())
+        # 第二幅无场坪图像仍有明确的负监督。
+        self.assertTrue((a.grad[1] > 0).all())
+
+    def test_diagnostic_sums_preserve_original_statistics(self):
+        module = load_module("attention_targets")
+        targets = labels([[.5, .5, .4, .4]], [0], [4])
+        logits = torch.zeros(2, 1, 40, 40)
+        original = module.attention_region_sums(logits, targets)
+        diagnostics, records = module.attention_region_sums(logits, targets,
+            include_diagnostics=True, return_records=True)
+        self.assertEqual(original, diagnostics[:4])
+        self.assertEqual(len(records), 2)
+        self.assertIsNone(records[1]["positive_energy_ratio"])
+        self.assertAlmostEqual(diagnostics[8] / diagnostics[9], .5)
+
 
 if __name__ == "__main__":
     unittest.main()

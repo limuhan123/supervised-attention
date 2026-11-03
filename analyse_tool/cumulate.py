@@ -44,7 +44,8 @@ def summarize_dataset_targets(dataset, num_classes, split_name="train"):
 def para_cumulate(config,model,device):
 
     num_classes = config["num_classes"]
-    train_dataset = YOLO_Dataset(config["data_path"], mode="train", image_size=640)
+    train_dataset = YOLO_Dataset(config["data_path"], mode="train", image_size=640,
+                                 label_filter_classes=config.get("label_filter_classes"))
     summarize_dataset_targets(train_dataset, num_classes, split_name="train")
     print("目标类别 :", num_classes)
 

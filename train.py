@@ -2,6 +2,10 @@ import os
 import copy
 import random
 import argparse
+import csv
+import json
+import time
+from pathlib import Path
 import numpy as np
 import torch
 import torch.optim as optim
@@ -10,8 +14,10 @@ from torch.amp import GradScaler
 from torch.amp import autocast
 from tqdm import tqdm
 from network import *
-from network.attention_targets import select_context_targets
+from network.attention_targets import select_context_targets, attention_region_sums
 from analyse_tool import *
+from analyse_tool.draw import save_training_curves
+from analyse_tool.overlay import visualize_overlay
 
 # 有分支的网络名称
 branch_network = ["Net_learn_branch", "Net_learn_branch_film","Net_learn_self_branch","YOLOv8_self_res","YOLOv8_small_self_branch"]
@@ -25,6 +31,15 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def save_json(path, values):
+    temporary = str(path) + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(values, stream, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
 
 
 def move_targets_to_device(targets, device):
@@ -83,13 +98,8 @@ def summarize_dataset_targets(dataset, num_classes, split_name="train"):
         print(f"[{split_name}] 警告: 发现越界类别ID -> {out_of_range_classes}")
 
 
-def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, best_val_loss, config, train_result=None, val_result=None):
+def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, best_val_loss, config, train_result=None, val_result=None, loader_generator=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    save_dir = os.path.join(path,config["save_name"])
-    number = 0
-    while os.path.exists(save_dir):
-        number += 1
-        save_dir = os.path.join(path,f"{config['save_name']}-{number}")
     torch.save(
         {
             "epoch": epoch,
@@ -101,13 +111,18 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, best_val_l
             "config": config,
             "train_result":train_result,
             "val_result" : val_result,
-            "model_name": config["model_name"]
+            "model_name": config["model_name"],
+            "rng_state": {"python": random.getstate(), "numpy": np.random.get_state(),
+                          "torch": torch.get_rng_state(),
+                          "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None},
+            "loader_rng": loader_generator.get_state() if loader_generator is not None else None,
         },
-        path,
+        str(path) + ".tmp",
     )
+    os.replace(str(path) + ".tmp", path)
 
 # 训练参数设置
-def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, device="cpu"):
+def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, device="cpu", loader_generator=None):
     checkpoint = torch.load(path, weights_only=False, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
@@ -125,6 +140,15 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, de
     ckpt_config = checkpoint.get("config", {})
     train_dict = checkpoint["train_result"]
     val_dict = checkpoint["val_result"]
+    state = checkpoint.get("rng_state")
+    if state:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"].cpu())
+        if state["cuda"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+    if loader_generator is not None and checkpoint.get("loader_rng") is not None:
+        loader_generator.set_state(checkpoint["loader_rng"].cpu())
     return start_epoch, best_val_loss, ckpt_config,train_dict,val_dict
 
 # 训练
@@ -139,9 +163,11 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, epoch, co
         epoch_sums = [0.0, 0.0, 0.0]
     total_images = 0
     optimizer_steps = 0
+    config["last_gradient_probe"] = {}
 
     optimizer.zero_grad(set_to_none=True)
-    pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/Train , best_loss {round(best_loss,4)}")
+    best_ap = -best_loss if np.isfinite(best_loss) else 0.0
+    pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/Train, best AP50-95 {best_ap:.4f}")
 
     for i, batch in enumerate(pbar):
         images = batch["images"].to(device, non_blocking=True)
@@ -158,7 +184,17 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, epoch, co
                 )
                 preds,branch_pred = model(images)
                 loss_all, loss_detach = loss_fn(preds, targets)
-                branch_loss = loss_fn.attention_loss(branch_pred,targets_branch)
+                with autocast("cuda", enabled=False):
+                    attention_loss = (loss_fn.attention_loss_strict
+                        if config.get("attention_supervision_mode", "relaxed") == "strict"
+                        else loss_fn.attention_loss)
+                    branch_loss = attention_loss(
+                        branch_pred.float(), targets_branch,
+                        lambda_out=1.0 if config["attention_loss_mode"] in ("full", "background") else 0.0,
+                        lambda_topk=0.5 if config["attention_loss_mode"] in ("full", "background") else 0.0,
+                        lambda_sparse=0.03 if config["attention_loss_mode"] in ("full", "background") else 0.0,
+                        lambda_ratio=0.5 if config["attention_loss_mode"] in ("full", "ratio") else 0.0,
+                    )
                 total_loss = (loss_all.sum() + branch_loss*config["branch_loss"])/ accumulate
 
             else:
@@ -166,6 +202,30 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, epoch, co
                 loss_all, loss_detach = loss_fn(preds, targets)
                 total_loss = loss_all.sum() / accumulate
 
+        window = min(accumulate, len(loader) - (i // accumulate) * accumulate)
+        total_loss = total_loss * accumulate / window
+        if not torch.isfinite(total_loss):
+            raise RuntimeError(f"Non-finite loss: epoch={epoch + 1}, batch={i + 1}")
+        interval = config.get("gradient_probe_interval", 0)
+        if interval and epoch % interval == 0 and i == 0:
+            # autograd.grad不写入.grad；不额外前向、不更新BN、不改变优化目标。
+            parameter = next(model.backbone[4].parameters())
+            scale = scaler.get_scale()
+            det_gradient = torch.autograd.grad(loss_all.sum() * scale / window,
+                parameter, retain_graph=True)[0].detach().float() / scale
+            aux_gradient = torch.zeros_like(det_gradient)
+            if branch and config["branch_loss"]:
+                aux_gradient = torch.autograd.grad(branch_loss * config["branch_loss"] * scale / window,
+                    parameter, retain_graph=True, allow_unused=True)[0]
+                aux_gradient = (aux_gradient.detach().float() / scale if aux_gradient is not None
+                                else torch.zeros_like(det_gradient))
+            valid = bool(torch.isfinite(det_gradient).all() and torch.isfinite(aux_gradient).all())
+            det_norm = float(det_gradient.norm()) if valid else None
+            aux_norm = float(aux_gradient.norm()) if valid else None
+            cosine = float((det_gradient * aux_gradient).sum() / (det_norm * aux_norm)) if valid and det_norm and aux_norm else None
+            config["last_gradient_probe"] = {"gradient_probe_valid": valid,
+                "gradient_det_norm": det_norm, "gradient_aux_norm": aux_norm,
+                "gradient_cosine": cosine}
         # 反向传播
         scaler.scale(total_loss).backward()
 
@@ -173,10 +233,11 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, epoch, co
         if should_step:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            previous_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            optimizer_steps += 1
+            optimizer_steps += int(scaler.get_scale() >= previous_scale)
 
         batch_size = images.size(0)
         current_sums = [
@@ -207,7 +268,7 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, epoch, co
     avg_dfl = epoch_sums[2] / total_images
     if branch:
         avg_branch = epoch_sums[3] * config["branch_loss"] / total_images
-    avg_total = sum(epoch_sums) / total_images
+    avg_total = sum(epoch_sums[:3]) / total_images
 
     if branch:
         return avg_box, avg_cls, avg_dfl, avg_branch,avg_total, optimizer_steps
@@ -225,6 +286,9 @@ def validate_one_epoch(model, loader, loss_fn, device, epoch, config):
     pred_records = []
     gt_records = []
     image_offset = 0
+    attention_sums = np.zeros(10, dtype=np.float64)
+    if config.get("collect_attention_details"):
+        config["last_attention_details"] = []
     with torch.no_grad():
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/Val", leave=False)
         for batch in pbar:
@@ -233,8 +297,26 @@ def validate_one_epoch(model, loader, loss_fn, device, epoch, config):
 
             with autocast("cuda",enabled=use_amp):   
                 preds = model(images, return_loss=True)
-                preds_map = get_eval_preds(model(images))
+                if config["model_name"] in branch_network:
+                    preds = preds[0]
+                inference_output = model(images)
+                preds_map = get_eval_preds(inference_output)
                 _, loss_detach = loss_fn(preds, targets)
+
+            if config["model_name"] in branch_network:
+                contexts = select_context_targets(
+                    move_targets_to_device(batch["other_targets"], device),
+                    config["attention_context_classes"],
+                )
+                if config.get("collect_attention_details"):
+                    sums, records = attention_region_sums(inference_output[1], contexts,
+                        include_diagnostics=True, return_records=True)
+                    for record in records:
+                        record["image_index"] = image_offset + record.pop("batch_index")
+                    config["last_attention_details"].extend(records)
+                else:
+                    sums = attention_region_sums(inference_output[1], contexts, include_diagnostics=True)
+                attention_sums += sums
 
             # 计算map50
             batch_pred_records, batch_gt_records = collect_map_records(
@@ -272,10 +354,17 @@ def validate_one_epoch(model, loader, loss_fn, device, epoch, config):
     avg_cls = epoch_sums[1] / total_images
     avg_dfl = epoch_sums[2] / total_images
     avg_total = sum(epoch_sums) / total_images
-    map_metrics = compute_map_from_records(pred_records, gt_records, config["num_classes"], iou_thresholds=[0.5])
+    map_metrics = compute_map_from_records(pred_records, gt_records, config["num_classes"],
+        iou_thresholds=[round(0.5 + 0.05 * i, 2) for i in range(10)])
     map50 = map_metrics["map50"]
     ap50 = map_metrics["ap50_per_class"]
-    return avg_box, avg_cls, avg_dfl, avg_total,map50,ap50
+    config["last_attention_positive"] = float(attention_sums[0] / attention_sums[1]) if attention_sums[1] else None
+    config["last_attention_background"] = float(attention_sums[2] / attention_sums[3]) if attention_sums[3] else None
+    config["last_attention_mean"] = float(attention_sums[4] / attention_sums[5]) if attention_sums[5] else None
+    config["last_positive_energy_ratio"] = float(attention_sums[6] / attention_sums[7]) if attention_sums[7] else None
+    config["last_empty_attention_mean"] = float(attention_sums[8] / attention_sums[9]) if attention_sums[9] else None
+    config["last_ap50_95"] = map_metrics["ap50_95_per_class"]
+    return avg_box, avg_cls, avg_dfl, avg_total,map50,ap50,map_metrics["map50_95"]
 
 
 def main(args):
@@ -309,7 +398,19 @@ def main(args):
         "save_ratio": args.save_ratio,
         "para_number": -1,
         "gflops":-1,
-        "branch_loss": args.branch_loss
+        "branch_loss": args.branch_loss,
+        "gate_mode": args.gate_mode,
+        "gate_init": args.gate_init,
+        "attention_loss_mode": args.attention_loss_mode,
+        "attention_supervision_mode": args.attention_supervision_mode,
+        "attention_shrink_ratio": 1.0 if args.attention_supervision_mode == "strict" else 0.85,
+        "attention_expand_ratio": 1.0 if args.attention_supervision_mode == "strict" else 1.15,
+        "attention_eval_regions": {"shrink": 0.85, "expand": 1.15},
+        "gradient_probe_interval": args.gradient_probe_interval,
+        "gradient_probe_parameter": "first parameter of backbone[4]",
+        "selection_metric": "validation_ap50_95",
+        "physical_gpu": os.environ.get("CUDA_VISIBLE_DEVICES", args.device),
+        "experiment": args.save_name.split("_")[0],
     }
 
     if config["model_name"] in branch_network:
@@ -324,13 +425,15 @@ def main(args):
         print("辅助分支学习预测场坪热力图，并用预测热力图加权检测特征；真实框仅用于损失监督")
 
     # 训练数据保存路径
-    os.makedirs(os.path.dirname(config["save_dir"]), exist_ok=True)
+    os.makedirs(config["save_dir"], exist_ok=True)
     save_dir = os.path.join(config["save_dir"],config["save_name"])
     number = 0
-    while os.path.exists(save_dir):
+    while not args.resume and os.path.exists(save_dir):
         number += 1
         save_dir = os.path.join(config["save_dir"],f"{config['save_name']}-{number}")
-    os.makedirs(save_dir)
+    if args.resume:
+        save_dir = os.path.dirname(os.path.abspath(args.resume))
+    os.makedirs(save_dir, exist_ok=bool(args.resume))
 
     set_seed(config["seed"])
 
@@ -368,6 +471,9 @@ def main(args):
         image_size=config["image_size"],
         label_filter_classes=config["label_filter_classes"],
     )
+    if args.smoke_batches:
+        train_dataset.image_paths = train_dataset.image_paths[:args.smoke_batches * config["batch_size"]]
+        val_dataset.image_paths = val_dataset.image_paths[:config["batch_size"]]
 
     # 计算数据集大小
     summarize_dataset_targets(train_dataset, config["num_classes"], split_name="train")
@@ -375,6 +481,7 @@ def main(args):
 
     # 数据集加载
     pin_memory = device.type == "cuda"
+    loader_generator = torch.Generator().manual_seed(config["seed"])
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size"],
@@ -383,6 +490,7 @@ def main(args):
         pin_memory=pin_memory,
         collate_fn=train_dataset.collate_fn,
         drop_last=False,
+        generator=loader_generator,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -402,6 +510,16 @@ def main(args):
     else:
         print("没有对应的神经网络，请检查名称")
         return
+
+    if config["model_name"] in ("YOLOv8_small_self_branch", "YOLOv8_small_se", "YOLOv8_small_cbam") and not args.resume and not args.pre_model:
+        set_seed(config["seed"])
+        baseline = YOLOv8_small(nc=config["num_classes"], scales=config["depth"])
+        model.load_state_dict(baseline.state_dict(), strict=False)
+        del baseline
+    if hasattr(model, "branch_scale"):
+        with torch.no_grad():
+            model.branch_scale.fill_(0.0 if args.gate_mode == "off" else args.gate_init)
+        model.branch_scale.requires_grad_(args.gate_mode == "learned")
     
     # 是否使用预训练权重
     if not args.resume and config["pre_model"] != "":
@@ -410,6 +528,9 @@ def main(args):
     # 计算神经网络参数量
     profile_model = copy.deepcopy(model).to(device).eval()
     config["para_number"],config["gflops"] = para_cumulate(config,profile_model,device)
+    del profile_model
+    set_seed(config["seed"])
+    save_json(os.path.join(save_dir, "config.json"), config)
 
     loss_fn = Loss(model)
 
@@ -428,9 +549,9 @@ def main(args):
         eta_min=config["lr"] * 0.05,
     )
 
-    scaler = GradScaler("cuda",enabled=config["use_amp"] and device.type == "cuda")
+    scaler = GradScaler("cuda",enabled=config["use_amp"] and device.type == "cuda", init_scale=128.0)
 
-    best_loss = 99999
+    best_loss = float("inf")  # 最小化 -AP50-95，保留原检查点字段以兼容读取工具。
     no_improve_count = 0
     start_epoch = 0
 
@@ -442,12 +563,14 @@ def main(args):
     train_dict["train_loss_cls"] = []
     train_dict["train_loss_dfl"] = []
     train_dict["train_loss_total"] = []
+    train_dict["train_loss_branch"] = []
 
     val_dict["val_loss_box"] = []
     val_dict["val_loss_cls"] = []
     val_dict["val_loss_dfl"] = []
     val_dict["val_loss_total"] = []
     val_dict["val_map50"] = []
+    val_dict["val_map50_95"] = []
 
     if args.resume:
         if not os.path.isfile(args.resume):
@@ -461,7 +584,13 @@ def main(args):
             scheduler=scheduler,
             scaler=scaler,
             device=device,
+            loader_generator=loader_generator,
         )
+        if ckpt_config.get("selection_metric") != config["selection_metric"]:
+            raise ValueError("旧检查点使用不同选模规则，不能直接续训本次消融")
+        no_improve_count = ckpt_config.get("no_improve_count", 0)
+        train_dict.setdefault("train_loss_branch", [])
+        val_dict.setdefault("val_map50_95", [])
 
         if isinstance(ckpt_config, dict):
             for key in ("num_classes", "image_size", "batch_size"):
@@ -469,10 +598,12 @@ def main(args):
                     print(f"警告: 当前配置 {key}={config.get(key)},checkpoint记录为 {ckpt_config[key]}")
 
         print(f"恢复训练的权重路径: {args.resume}")
-        print(f"恢复训练的轮次: {start_epoch}, 最佳训练损失值: {best_loss:.4f}")
+        print(f"恢复训练的轮次: {start_epoch}, 最佳验证AP50-95: {-best_loss:.4f}")
 
 
     for epoch in range(start_epoch, config["epochs"]):
+        epoch_start = time.time()
+        train_branch = 0.0
 
         if config["model_name"] in branch_network:
             train_box, train_cls, train_dfl, train_branch,train_total, optimizer_steps = train_one_epoch(
@@ -487,8 +618,9 @@ def main(args):
         train_dict["train_loss_cls"].append(train_cls)
         train_dict["train_loss_dfl"].append(train_dfl)
         train_dict["train_loss_total"].append(train_total)
+        train_dict["train_loss_branch"].append(train_branch)
 
-        val_box, val_cls, val_dfl, val_total,map50,ap50 = validate_one_epoch(
+        val_box, val_cls, val_dfl, val_total,map50,ap50,map50_95 = validate_one_epoch(
             model, val_loader, loss_fn, device, epoch, config
         )
         
@@ -497,6 +629,7 @@ def main(args):
         val_dict["val_loss_dfl"].append(val_dfl)
         val_dict["val_loss_total"].append(val_total)
         val_dict["val_map50"].append(map50)
+        val_dict["val_map50_95"].append(map50_95)
         if optimizer_steps > 0:
             scheduler.step()
 
@@ -514,30 +647,83 @@ def main(args):
         print(
             f"Valid | Box: {val_box:.4f}, Cls: {val_cls:.4f}, "
             f"DFL: {val_dfl:.4f}, Total: {val_total:.4f}, "
-            f"map50: {map50:.4f}"
+            f"AP50: {map50:.4f}, AP50-95: {map50_95:.4f}"
         )
 
-        last_path = os.path.join(save_dir, "last.pth")
-        save_checkpoint(last_path, epoch, model, optimizer, scheduler, scaler, best_loss, config, train_dict, val_dict)
-        # 损失值
-        best_loss_temple = round(config["save_ratio"]*val_total + (1-config["save_ratio"])*train_total,4)
+        best_loss_temple = -map50_95
 
         if best_loss_temple < best_loss:
             best_loss = best_loss_temple
             no_improve_count = 0
             best_path = os.path.join(save_dir, "best.pth")
-            save_checkpoint(best_path, epoch, model, optimizer, scheduler, scaler, best_loss, config)
-            print(f"New best model saved. Best_Loss: {best_loss:.4f}")
+            config["no_improve_count"] = no_improve_count
+            save_checkpoint(best_path, epoch, model, optimizer, scheduler, scaler, best_loss, config, train_dict, val_dict, loader_generator)
+            print(f"New best model saved. AP50-95: {-best_loss:.4f}")
         else:
             no_improve_count += 1
-            print(f"No improvement. Patience: {no_improve_count}/{config['patience']}, loss_temple: {best_loss_temple}")
+            print(f"No improvement. Patience: {no_improve_count}/{config['patience']}, AP50-95: {map50_95:.4f}")
+
+        config["no_improve_count"] = no_improve_count
+        save_checkpoint(os.path.join(save_dir, "last.pth"), epoch, model, optimizer, scheduler,
+                        scaler, best_loss, config, train_dict, val_dict, loader_generator)
+        row = {"epoch": epoch + 1, "train_det_loss": train_total, "val_det_loss": val_total,
+               "train_aux_loss": train_branch / config["branch_loss"] if config["branch_loss"] else None,
+               "map50": map50, "map50_95": map50_95, "ap50": ap50,
+               "ap50_95": config["last_ap50_95"],
+               "gate": float(model.branch_scale.detach()) if hasattr(model, "branch_scale") else None,
+               "attention_positive": config.get("last_attention_positive"),
+               "attention_background": config.get("last_attention_background"),
+               "attention_mean": config.get("last_attention_mean"),
+               "positive_energy_ratio": config.get("last_positive_energy_ratio"),
+               "empty_attention_mean": config.get("last_empty_attention_mean"),
+               "effective_gate_positive": float(model.branch_scale.detach()) * config["last_attention_positive"]
+                    if hasattr(model, "branch_scale") and config.get("last_attention_positive") is not None else None,
+               "effective_gate_background": float(model.branch_scale.detach()) * config["last_attention_background"]
+                    if hasattr(model, "branch_scale") and config.get("last_attention_background") is not None else None,
+               "gradient_det_norm": config["last_gradient_probe"].get("gradient_det_norm"),
+               "gradient_aux_norm": config["last_gradient_probe"].get("gradient_aux_norm"),
+               "gradient_cosine": config["last_gradient_probe"].get("gradient_cosine"),
+               "gradient_probe_valid": config["last_gradient_probe"].get("gradient_probe_valid"),
+               "lr": optimizer.param_groups[0]["lr"], "seconds": time.time() - epoch_start,
+               "optimizer_steps": optimizer_steps,
+               "peak_gpu_mb": torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0}
+        metrics_path = os.path.join(save_dir, "metrics.csv")
+        with open(metrics_path, "a", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(row))
+            if stream.tell() == 0:
+                writer.writeheader()
+            writer.writerow(row)
+        save_json(os.path.join(save_dir, "status.json"), dict(row, state="running",
+                  best_map50_95=-best_loss, experiment=config["experiment"], seed=config["seed"]))
+        if best_loss_temple == best_loss and no_improve_count == 0:
+            save_json(os.path.join(save_dir, "best_metrics.json"), row)
+        if epoch == 0 or (epoch + 1) % 5 == 0:
+            save_training_curves(save_dir)
 
         if no_improve_count >= config["patience"]:
             print(f"Early stopping at epoch {epoch + 1}")
             break
 
     print(f"\n训练完成,文件保存路径为：{save_dir}")
-    print(f"Best val loss: {best_loss:.4f}")
+    status_path = os.path.join(save_dir, "status.json")
+    with open(status_path, encoding="utf-8") as stream:
+        status = json.load(stream)
+    status["state"] = "complete"
+    save_json(status_path, status)
+    save_training_curves(save_dir)
+    if config["model_name"] in branch_network:
+        checkpoint = torch.load(os.path.join(save_dir, "best.pth"), map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        preview_dir = os.path.join(save_dir, "attention_previews")
+        os.makedirs(preview_dir, exist_ok=True)
+        with torch.inference_mode():
+            for index in range(min(6, len(val_dataset))):
+                image = val_dataset[index]["image"].unsqueeze(0).to(device)
+                _, attention = model(image)
+                filename = Path(val_dataset.image_paths[index]).stem + ".png"
+                visualize_overlay(image, attention, os.path.join(preview_dir, filename))
+    print(f"Best validation AP50-95: {-best_loss:.4f}")
 
 # 训练参数设置
 def parser_set():
@@ -558,7 +744,7 @@ def parser_set():
     parser.add_argument("--seed", type=int, default=42, help="随机数种子")
     parser.add_argument("--save_dir", type=str, default="weights/1/high", help="权重保存路径")
     parser.add_argument("--save_name",type=str,default="1-yolov8_small_self_branch_p4_4.5",help="训练结果保存名称")
-    parser.add_argument("--use_amp",type=bool,default=True,help="是否在训练时使用AMP")
+    parser.add_argument("--use_amp",action=argparse.BooleanOptionalAction,default=True,help="是否在训练时使用AMP")
     parser.add_argument("--val_conf_threshold", type=float, default=0.001, help="验证mAP使用的置信度阈值,越低越准但越慢")
     parser.add_argument("--val_nms_iou_threshold", type=float, default=0.7, help="验证mAP使用的NMS IoU阈值")
     parser.add_argument("--val_pre_nms_topk", type=int, default=1000, help="每张图NMS前最多保留的候选框数量")
@@ -569,12 +755,20 @@ def parser_set():
     parser.add_argument(
         "--label_filter_classes",
         type=str,
-        default="0,1,2,3",
+        default="0",
         help="只处理这些类别的标签,例如: 0,2,3; 不传则处理全部标签",
     )
     parser.add_argument("--model_name",type=str,default="YOLOv8_small_self_branch",help="使用的神经网络名称")
-    parser.add_argument("--branch_loss",type=float,default=4.5,help="分支损失占总损失的比例,为0时表示不计算分支损失")
-    parser.add_argument("--save_ratio",type=float,default=0.7,help="训练保存时,验证集和训练集的损失值比例")
+    parser.add_argument("--branch_loss",type=float,default=0.5,help="辅助损失缩放系数，并非总损失占比")
+    parser.add_argument("--gate_mode", choices=("learned", "fixed", "off"), default="learned")
+    parser.add_argument("--gate_init", type=float, default=0.5)
+    parser.add_argument("--attention_loss_mode", choices=("full", "base", "background", "ratio"), default="full")
+    parser.add_argument("--attention_supervision_mode", choices=("relaxed", "strict"), default="relaxed",
+                        help="relaxed使用原内缩/外扩忽略带损失；strict使用原框内外全部像素监督")
+    parser.add_argument("--gradient_probe_interval", type=int, default=0,
+                        help="每隔若干轮采样首批次任务梯度，仅记录、不更新参数；0关闭")
+    parser.add_argument("--smoke_batches", type=int, default=0, help="短程检查的训练批次数；0为完整数据")
+    parser.add_argument("--save_ratio",type=float,default=0.7,help="仅保留旧接口兼容；本次统一按验证AP50-95选模")
     parser.add_argument("--depth",type=tuple,default=(0.33, 0.25, 1024),
                         help="神经网络的深度参数,第一个是每层重复数量,第二个是通道倍率(至少是64的公因数倒数),第三个是最大通道限制")
     args = parser.parse_args()

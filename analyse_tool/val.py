@@ -6,6 +6,67 @@ from torch.amp import autocast
 from thop import profile
 from pathlib import Path
 import json
+import csv
+
+
+def export_attention_diagnostics(model_path, output_dir, device="cuda:0", gate_values=(None,)):
+    """复用train.py验证程序，读取已有权重；不训练、不改写检查点。"""
+    from train import validate_one_epoch, set_seed
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = torch.load(model_path, weights_only=False, map_location="cpu")
+    config = dict(checkpoint["config"])
+    set_seed(config.get("seed", 42))
+    config["use_amp"] = config["use_amp"] and str(device).startswith("cuda")
+    config["collect_attention_details"] = True
+    config["attention_context_classes"] = config.get("attention_context_classes", [4])
+    dataset = YOLO_Dataset(config["data_path"], mode="val", image_size=config["image_size"],
+                           label_filter_classes=config["label_filter_classes"])
+    loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False,
+                        num_workers=0, pin_memory=str(device).startswith("cuda"), collate_fn=dataset.collate_fn)
+    device = torch.device(device)
+    model = globals()[config["model_name"]](nc=config["num_classes"], scales=config["depth"]).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    original_gate = float(model.branch_scale.detach()) if hasattr(model, "branch_scale") else None
+    summaries = []
+    for gate in gate_values:
+        if gate is not None and original_gate is None:
+            raise ValueError("该模型没有可进行推理干预的branch_scale")
+        used_gate = original_gate if gate is None else float(gate)
+        if used_gate is not None:
+            with torch.no_grad():
+                model.branch_scale.fill_(used_gate)
+        result = validate_one_epoch(model, loader, Loss(model), device, 0, config)
+        label = "saved_gate" if gate is None else f"gate_{gate:g}"
+        rows = []
+        for values in config.get("last_attention_details", []):
+            row = dict(values)
+            row["image"] = Path(dataset.image_paths[row["image_index"]]).name
+            row["gate"] = used_gate
+            for name in ("positive_mean", "background_mean"):
+                row["gA_" + name] = used_gate * row[name] if used_gate is not None and row[name] is not None else None
+            rows.append(row)
+        if rows:
+            with (output_dir / f"{label}_per_image.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+        summary = {"checkpoint": str(model_path), "intervention": label, "gate": used_gate,
+            "AP50": result[4], "AP50_95": result[6], "validation_images": len(dataset),
+            "attention_positive": config.get("last_attention_positive"),
+            "attention_background": config.get("last_attention_background"),
+            "positive_energy_ratio": config.get("last_positive_energy_ratio"),
+            "empty_attention_mean": config.get("last_empty_attention_mean"),
+            "gA_positive": used_gate * config["last_attention_positive"]
+                if used_gate is not None and config.get("last_attention_positive") is not None else None,
+            "gA_background": used_gate * config["last_attention_background"]
+                if used_gate is not None and config.get("last_attention_background") is not None else None,
+            "attention_evaluation_regions": {"shrink": .85, "expand": 1.15}}
+        summaries.append(summary)
+        with (output_dir / "summary.json").open("w", encoding="utf-8") as stream:
+            json.dump(summaries, stream, ensure_ascii=False, indent=2)
+        print("INFERENCE_DIAGNOSTIC", json.dumps(summary), flush=True)
+    return summaries
 
 
 
@@ -44,7 +105,7 @@ def val_main(model_path):
     print(f"Device: {device}")
 
     # 加载权重
-    checkpoint = torch.load(model_path, weights_only=False, map_location="cuda")
+    checkpoint = torch.load(model_path, weights_only=False, map_location="cpu")
     config = checkpoint["config"]
     # print(config["data_path"])
     network_name = config['model_name']
@@ -70,7 +131,8 @@ def val_main(model_path):
     model.load_state_dict(checkpoint['model_state_dict'])
     loss_fn = Loss(model)
     model.eval()
-    print(model.branch_scale.item())
+    if hasattr(model, "branch_scale"):
+        print(model.branch_scale.item())
     use_amp = config["use_amp"] and device.type == "cuda"
     epoch_sums = [0.0, 0.0, 0.0]
     total_images = 0
@@ -125,6 +187,8 @@ def val_main(model_path):
     ap50_95 = map_metrics["ap50_95_per_class"]
     map50_95 = map_metrics["map50_95"]
     map_per = map_metrics["map_per_iou"]
+    from network.ap_profile import summarize_ap_profile
+    ap_profile = summarize_ap_profile(map_metrics)
 
     print(
             f"Valid | Box: {avg_box:.4f}, Cls: {avg_cls:.4f}, "
@@ -153,7 +217,7 @@ def val_main(model_path):
             "model_path": str(model_path),
             "num_classes": int(num_classes),
             "image_size": int(config["image_size"]),
-            "branch_scale":round(float(model.branch_scale.item()),3)
+            "branch_scale": float(model.branch_scale.item()) if hasattr(model, "branch_scale") else None
         },
 
         #验证损失
@@ -166,6 +230,7 @@ def val_main(model_path):
 
         # 检测指标
         "metrics": {
+            "full_precision_profile": ap_profile,
             "map50": round(float(map50), 3),
             "map50_95": round(float(map50_95), 3),
 

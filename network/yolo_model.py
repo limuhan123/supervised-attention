@@ -44,12 +44,18 @@ class YOLOv8_small(nn.Module):
         self.detect.stride = self.stride #设置采样率
         self.detect.bias_init()  # 初始化检测头的偏置
 
+    def apply_p4_attention(self, x):
+        """Identity for A0; external controls override this single insertion slot."""
+        return x
+
     def forward(self, x, return_loss=False):
         """Forward pass through YOLOv8 model."""
         # -------------------- backbone --------------------
         backbone_features = []
         for i, module in enumerate(self.backbone):
             x = module(x)
+            if i == 5:
+                x = self.apply_p4_attention(x)
             if i in [4, 8]:  # 保存P3, P4
                 backbone_features.append(x)
         p3, p4 = backbone_features  # 更直观命名
@@ -67,6 +73,49 @@ class YOLOv8_small(nn.Module):
 
         # -------------------- detect --------------------
         return self.detect([p3_out, p4_out], return_loss=return_loss)
+
+
+class CBAMReference(nn.Module):
+    """CBAM author-code structure: shared biased MLP, max/avg spatial pooling, BN.
+
+    https://github.com/Jongchan/attention-module/blob/master/MODELS/cbam.py
+    Kept separate from the legacy simplified CBAM to preserve old checkpoints.
+    """
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        hidden = max(channels // reduction, 1)
+        self.mlp = nn.Sequential(nn.Flatten(), nn.Linear(channels, hidden),
+                                 nn.ReLU(), nn.Linear(hidden, channels))
+        self.spatial = nn.Sequential(
+            nn.Conv2d(2, 1, 7, padding=3, bias=False),
+            nn.BatchNorm2d(1, eps=1e-5, momentum=0.01))
+
+    def forward(self, x):
+        channel = self.mlp(x.mean((2, 3), keepdim=True))
+        channel = channel + self.mlp(x.amax((2, 3), keepdim=True))
+        x = x * channel.sigmoid()[:, :, None, None]
+        spatial = torch.cat((x.amax(1, keepdim=True), x.mean(1, keepdim=True)), 1)
+        return x * self.spatial(spatial).sigmoid()
+
+
+class YOLOv8_small_se(YOLOv8_small):
+    """Two-scale A0 backbone + one SE block after backbone[5], reduction=16."""
+    def __init__(self, nc=80, scales=(0.33, 0.25, 1024)):
+        super().__init__(nc=nc, scales=scales)
+        self.external_attention = SEBlock(min(int(512 * scales[1]), scales[2]), 16)
+
+    def apply_p4_attention(self, x):
+        return self.external_attention(x)
+
+
+class YOLOv8_small_cbam(YOLOv8_small):
+    """Two-scale A0 backbone + one CBAM block at exactly the A3 injection slot."""
+    def __init__(self, nc=80, scales=(0.33, 0.25, 1024)):
+        super().__init__(nc=nc, scales=scales)
+        self.external_attention = CBAMReference(min(int(512 * scales[1]), scales[2]), 16)
+
+    def apply_p4_attention(self, x):
+        return self.external_attention(x)
 
 
 class YOLOv8(nn.Module):

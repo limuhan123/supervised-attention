@@ -380,6 +380,65 @@ class Loss():
         return total_loss / max(B, 1)
 
     @staticmethod
+    def attention_loss_strict(
+        pred_logits,
+        targets,
+        lambda_dice=1.0,
+        lambda_out=1.0,
+        lambda_topk=0.5,
+        lambda_sparse=0.03,
+        lambda_ratio=0.5,
+        target_ratio=0.7,
+        topk_ratio=0.1,
+        eps=1e-6,
+    ):
+        """严格框区域监督：原框并集内为1，框外为0，全部像素参与监督。
+
+        与attention_loss使用相同组成项、默认系数及按图像求均值的归一化。
+        本函数不使用内缩、外扩或忽略带，也不改变原来的放缓损失实现。
+        """
+        if pred_logits.dim() != 4 or pred_logits.shape[1] != 1:
+            raise ValueError(f"Expected [B,1,H,W] logits, got {pred_logits.shape}")
+        batch, _, height, width = pred_logits.shape
+        device, dtype = pred_logits.device, pred_logits.dtype
+        batch_ids = targets["batch_id"].view(-1).long().to(device)
+        boxes = targets["bboxes"].to(device=device, dtype=dtype)
+        total_loss = pred_logits.new_tensor(0.0)
+        for index in range(batch):
+            logits = pred_logits[index, 0]
+            attention = logits.sigmoid()
+            positive = torch.zeros((height, width), device=device, dtype=dtype)
+            for cx, cy, bw, bh in boxes[batch_ids == index]:
+                cx, cy, bw, bh = cx * width, cy * height, bw * width, bh * height
+                x1 = int(torch.floor(torch.clamp(cx - bw / 2, 0, width)).item())
+                x2 = int(torch.ceil(torch.clamp(cx + bw / 2, 0, width)).item())
+                y1 = int(torch.floor(torch.clamp(cy - bh / 2, 0, height)).item())
+                y2 = int(torch.ceil(torch.clamp(cy + bh / 2, 0, height)).item())
+                if x2 > x1 and y2 > y1:
+                    positive[y1:y2, x1:x2] = 1.0
+            negative = 1.0 - positive
+            valid = torch.ones_like(positive)
+            focal = Loss.focal_bce_with_logits(logits, positive, valid_mask=valid)
+            has_positive = bool(positive.sum() > 0)
+            dice = (Loss.dice_loss_from_prob(attention, positive, valid_mask=valid)
+                    if has_positive else pred_logits.new_tensor(0.0))
+            if negative.sum() > 0:
+                outside = attention[negative.bool()]
+                outside_mean = outside.mean()
+                k = max(1, int(topk_ratio * outside.numel()))
+                topk = outside.topk(k).values.mean()
+                sparse = (attention * negative).sum() / (negative.sum() + eps)
+            else:
+                outside_mean = pred_logits.new_tensor(0.0)
+                topk = pred_logits.new_tensor(0.0)
+                sparse = pred_logits.new_tensor(0.0)
+            ratio = (F.relu(target_ratio - (attention * positive).sum() / (attention.sum() + eps))
+                     if has_positive else pred_logits.new_tensor(0.0))
+            total_loss += (focal + lambda_dice * dice + lambda_out * outside_mean
+                           + lambda_topk * topk + lambda_sparse * sparse + lambda_ratio * ratio)
+        return total_loss / max(batch, 1)
+
+    @staticmethod
     def focal_scene_context_loss(scene_logits, targets, context_cls_id=4, alpha=0.25, gamma=2.0):
         """
         基于 Focal Loss 的纯辅助场坪场景监督。

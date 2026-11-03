@@ -14,6 +14,7 @@ weights/
 # 临时文件和生成产物
 tmp/
 output/
+server_experiments_*/
 
 # 本地环境和凭据
 .env

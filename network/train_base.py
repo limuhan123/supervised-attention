@@ -1634,7 +1634,7 @@ def compute_map_from_records(pred_records, gt_records, num_classes, iou_threshol
             fp_cum = torch.cumsum(fp, dim=0)
             recall = tp_cum / (gt_count + 1e-16)
             precision = tp_cum / (tp_cum + fp_cum + 1e-16)
-            ap_per_class.append(round(compute_ap(recall, precision),3))
+            ap_per_class.append(compute_ap(recall, precision))
 
         if valid_classes:
             map_value = sum(ap_per_class[i] for i in valid_classes) / len(valid_classes)
@@ -1642,12 +1642,12 @@ def compute_map_from_records(pred_records, gt_records, num_classes, iou_threshol
             map_value = 0.0
 
         ap_per_class_by_iou.append(ap_per_class)
-        map_per_iou.append(round(map_value,3))
+        map_per_iou.append(map_value)
 
     ap50_95_per_class = []
     for c in range(num_classes):
         ap_c = [ap_per_class_by_iou[k][c] for k in range(len(iou_thresholds))]
-        ap50_95_per_class.append(round(sum(ap_c) / len(ap_c),3))
+        ap50_95_per_class.append(sum(ap_c) / len(ap_c))
 
     return {
         "iou_thresholds": iou_thresholds,

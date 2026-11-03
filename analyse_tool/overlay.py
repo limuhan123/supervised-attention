@@ -17,6 +17,7 @@ def visualize_overlay(image, features, save_path=None):
     
     # 将输入图片(tensor反向处理或直接用预处理时的padded图)转为 uint8
     img_show = (image.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    img_show = cv2.cvtColor(img_show, cv2.COLOR_RGB2BGR)
     h, w = img_show.shape[:2]
     
     # 将热力图放大到原图尺寸
@@ -24,7 +25,7 @@ def visualize_overlay(image, features, save_path=None):
     
     # 转为伪彩色
     heatmap = np.uint8(255 * att_map_resized)
-    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_VIRIDIS)
     
     # 叠加
     overlay = cv2.addWeighted(img_show, 0.5, heatmap_color, 0.5, 0)
@@ -33,21 +34,10 @@ def visualize_overlay(image, features, save_path=None):
         cv2.imwrite(save_path,overlay)
 
 def preprocess_image(image, img_size=640):
-    # 调整大小
-    h, w = image.shape[:2]
-    scale = min(img_size / h, img_size / w)
-    new_h, new_w = int(h * scale), int(w * scale)
-    resized = cv2.resize(image, (new_w, new_h))
-    
-    # 填充到正方形
-    padded = np.full((img_size, img_size, 3), 114, dtype=np.uint8)
-    padded[:new_h, :new_w] = resized
-    
-    # 转换为tensor并归一化
-    tensor = torch.from_numpy(padded).permute(2, 0, 1).float() / 255.0
-    tensor = tensor.unsqueeze(0)  # 添加batch维度
-    
-    return tensor
+    # 与训练保持相同的居中letterbox，而不是左上角填充。
+    padded, _ = YOLO_Dataset.letterbox(image, np.zeros((0, 5), dtype=np.float32),
+                                     new_shape=img_size, color=(114, 114, 114))
+    return torch.from_numpy(padded).permute(2, 0, 1).float().unsqueeze(0) / 255.0
 
 def main_branch(model_path,image_path):
     device = torch.device("cpu")
@@ -60,16 +50,17 @@ def main_branch(model_path,image_path):
     image = cv2.imread(image_path)
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # BGR转RGB
     input_tensor = preprocess_image(image)
-    _,result = my_model(input_tensor)
+    with torch.inference_mode():
+        _,result = my_model(input_tensor)
     print(f"Backbone 输出形状: {result.shape}")
 
     #获取保存路径
     save_dir = Path(model_path).parent
-    img_name = Path(image_path).parent.name
-    save_path = save_dir / f"{img_name}-overlay"
+    img_name = Path(image_path).stem
+    save_path = save_dir / f"{img_name}-overlay.png"
 
     #可视化所有通道的平均激活
-    visualize_overlay(input_tensor, result, save_path=save_path)
+    visualize_overlay(input_tensor, result, save_path=str(save_path))
 
 
 if __name__ == "__main__":

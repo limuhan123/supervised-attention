@@ -1,8 +1,136 @@
 import argparse
+import csv
+import json
+import statistics
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
+
+
+def save_training_curves(save_dir):
+    """从train.py逐轮CSV绘图，不需要重新读取大权重文件。"""
+    save_dir = Path(save_dir)
+    with (save_dir / "metrics.csv").open(encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    if not rows:
+        return
+    with (save_dir / "best_metrics.json").open(encoding="utf-8") as stream:
+        best_epoch = json.load(stream)["epoch"]
+    panels = [("Detection loss", [("train_det_loss", "Train"), ("val_det_loss", "Validation")]),
+              ("Validation AP", [("map50", "AP50"), ("map50_95", "AP50-95")]),
+              ("Residual coefficient", [("gate", "g")]),
+              ("Auxiliary loss", [("train_aux_loss", "Unweighted auxiliary loss")]),
+              ("Attention response", [("attention_positive", "Positive region"),
+                                      ("attention_background", "Background")]),
+              ("Learning rate", [("lr", "Learning rate")])]
+    from matplotlib.ticker import MaxNLocator
+    with plt.rc_context({"figure.facecolor": "white", "axes.facecolor": "white",
+                         "axes.spines.top": False, "axes.spines.right": False, "font.size": 9}):
+        figure, axes = plt.subplots(2, 3, figsize=(12, 6.3), layout="constrained")
+        epochs = [int(row["epoch"]) for row in rows]
+        for axis, (title, series) in zip(axes.flat, panels):
+            present = False
+            for (key, label), color in zip(series, ("#76a5c6", "#85b69c")):
+                valid = [(int(row["epoch"]), float(row[key])) for row in rows
+                         if row.get(key) not in (None, "", "None")]
+                if valid:
+                    present = True
+                    axis.plot(*zip(*valid), label=label, color=color, linewidth=1.8,
+                              marker="o" if len(valid) < 3 else None, markersize=3)
+            axis.set_title(title)
+            if not present:
+                axis.text(.5, .5, "Not used", ha="center", transform=axis.transAxes, color="#888")
+                axis.set_axis_off()
+                continue
+            axis.axvline(best_epoch, color="#aaa", linestyle=":", linewidth=1)
+            axis.set(xlabel="Epoch", xlim=(.5, max(2, epochs[-1] + .5)))
+            axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+            axis.grid(alpha=.15)
+            axis.legend(frameon=False, fontsize=8)
+            if title in ("Validation AP", "Attention response"):
+                axis.set_ylim(0, 1)
+        figure.suptitle(save_dir.name + " | selected by validation AP50-95", fontsize=11)
+        figure.savefig(save_dir / "training_curves.png", dpi=180)
+        figure.savefig(save_dir / "training_curves.pdf")
+        plt.close(figure)
+    if "effective_gate_positive" in rows[0]:
+        save_attention_diagnostic_curves(save_dir, rows)
+
+
+def save_attention_diagnostic_curves(save_dir, rows):
+    panels = [("Actual modulation gA", [("effective_gate_positive", "Positive region"),
+                                         ("effective_gate_background", "Background")]),
+              ("Positive-region energy fraction", [("positive_energy_ratio", "Mean over images with sites")]),
+              ("Shared P3 gradient norms before clipping", [("gradient_det_norm", "Detection"),
+                                                              ("gradient_aux_norm", "Weighted auxiliary")]),
+              ("Detection / auxiliary gradient cosine", [("gradient_cosine", "Cosine")])]
+    from matplotlib.ticker import MaxNLocator
+    with plt.rc_context({"figure.facecolor": "white", "axes.facecolor": "white",
+                         "axes.spines.top": False, "axes.spines.right": False, "font.size": 9}):
+        figure, axes = plt.subplots(2, 2, figsize=(10, 6), layout="constrained")
+        for axis, (title, series) in zip(axes.flat, panels):
+            present = False
+            for (key, label), color in zip(series, ("#76a5c6", "#85b69c")):
+                valid = [(int(row["epoch"]), float(row[key])) for row in rows
+                    if row.get(key) not in (None, "", "None")
+                    and ("gradient norms" not in title or float(row[key]) > 0)]
+                if valid:
+                    present = True
+                    axis.plot(*zip(*valid), marker="o" if len(valid) < 3 else None,
+                              markersize=3, linewidth=1.7, color=color, label=label)
+            axis.set_title(title)
+            if not present:
+                axis.text(.5, .5, "Not used / not sampled", ha="center", transform=axis.transAxes)
+                axis.set_axis_off()
+                continue
+            axis.set_xlabel("Epoch")
+            axis.set_xlim(.5, max(2, max(int(row["epoch"]) for row in rows) + .5))
+            axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+            axis.grid(alpha=.15)
+            axis.legend(frameon=False, fontsize=8)
+            if "gradient norms" in title:
+                axis.set_yscale("log")
+            elif "cosine" in title:
+                axis.set_ylim(-1.05, 1.05)
+                axis.axhline(0, color="#aaa", linewidth=.7)
+            elif "energy fraction" in title:
+                axis.set_ylim(0, 1)
+            elif title == "Actual modulation gA":
+                lower, upper = axis.get_ylim()
+                axis.set_ylim(min(0, lower), max(0, upper))
+                axis.ticklabel_format(axis="y", style="plain", useOffset=False)
+        figure.suptitle(Path(save_dir).name, fontsize=11)
+        figure.savefig(Path(save_dir) / "attention_diagnostics.png", dpi=180)
+        figure.savefig(Path(save_dir) / "attention_diagnostics.pdf")
+        plt.close(figure)
+
+
+def save_experiment_comparison(rows, output):
+    rows = [row for row in rows if row["state"] == "complete"]
+    if not rows:
+        return
+    figure, axis = plt.subplots(figsize=(9, 4.5), layout="constrained", facecolor="white")
+    groups = {}
+    for row in rows:
+        groups.setdefault(row["experiment"], []).append(row)
+    names = list(groups)
+    x = list(range(len(names)))
+    for offset, key, label, color in ((-.18, "AP50", "AP50", "#76a5c6"),
+                                      (.18, "AP50_95", "AP50-95", "#85b69c")):
+        values = [100 * statistics.mean(r[key] for r in groups[name]) for name in names]
+        errors = [100 * statistics.stdev(r[key] for r in groups[name]) if len(groups[name]) > 1 else 0
+                  for name in names]
+        bars = axis.bar([v + offset for v in x], values, .34,
+                        yerr=errors, capsize=2, color=color, label=label)
+        axis.bar_label(bars, fmt="%.2f", padding=3, fontsize=8)
+    axis.set(xticks=x, xticklabels=[name + f"\nn={len(groups[name])}" for name in names], ylim=(0, 105),
+             ylabel="Validation AP (%)", title="Single target 0 | mean, sample SD for repeated runs")
+    axis.legend(frameon=False)
+    axis.spines[["top", "right"]].set_visible(False)
+    figure.savefig(Path(output) / "comparison.png", dpi=200)
+    figure.savefig(Path(output) / "comparison.pdf")
+    plt.close(figure)
 
 
 def load_loss_data(model_path: Path,dataset,data_select):
